@@ -338,6 +338,7 @@ pre {
 }
 
 .ghost-btn {
+  display: inline-block;
   padding: 8px 14px;
   border: 1px solid var(--line-2);
   color: var(--ink-dim);
@@ -368,6 +369,10 @@ pre {
 }
 
 .req-list-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
   padding: 10px 16px;
   font-size: 10px;
   letter-spacing: 0.2em;
@@ -678,6 +683,37 @@ pre {
   color: var(--phosphor);
 }
 
+.landing-error {
+  color: var(--m-delete);
+  max-width: 48ch;
+}
+
+.req-list-retention {
+  letter-spacing: 0.06em;
+  text-transform: none;
+}
+
+.req-list-empty {
+  padding: 48px 16px;
+  text-align: center;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.empty-sub {
+  color: var(--ink-dim);
+  max-width: 46ch;
+}
+
+.muted {
+  color: var(--ink-faint);
+}
+
+:focus-visible {
+  outline: 1px solid var(--phosphor);
+  outline-offset: 2px;
+}
+
 /* scrollbars -------------------------------------------------------------- */
 
 ::-webkit-scrollbar {
@@ -710,5 +746,15 @@ pre {
   .req-list {
     border-right: none;
     border-bottom: 1px solid var(--line);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }

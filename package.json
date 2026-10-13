@@ -1,22 +1,30 @@
 {
-  "name": "webhook-inspector",
+  "name": "hookscope",
   "version": "0.1.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "nanoid": "^5.1.16",
-    "next": "^16.2.10",
+    "next": "^16.4.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "redis": "^6.3.0",
+    "undici": "^8.11.2"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "typescript": "7.0.2"
+  },
+  "description": "Webhook inspector: temporary URLs that capture HTTP requests, stream them live over SSE, and replay them.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.9"
   }
 }

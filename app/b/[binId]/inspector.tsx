@@ -2,33 +2,9 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { CapturedRequest, ReplayResult } from "@/lib/types";
 
-// Mirrors CapturedRequest in lib/store.ts — kept as a separate type because
-// this file ships to the browser and must not import the server store.
-interface CapturedRequest {
-  id: string;
-  binId: string;
-  method: string;
-  path: string;
-  query: Record<string, string>;
-  headers: Record<string, string>;
-  body: string;
-  bodyEncoding: "utf8" | "base64" | "none";
-  bodyTruncated: boolean;
-  contentType: string | null;
-  size: number;
-  ip: string | null;
-  receivedAt: number;
-}
-
-interface ReplayResult {
-  ok: boolean;
-  status?: number;
-  statusText?: string;
-  durationMs: number;
-  body?: string;
-  error?: string;
-}
+type LinkState = "connecting" | "live" | "reconnecting" | "error";
 
 function formatTime(ts: number) {
   return new Date(ts).toLocaleTimeString("en-GB", { hour12: false });
@@ -50,33 +26,46 @@ function prettyBody(req: CapturedRequest): string {
   }
 }
 
+/** POSIX single-quote escaping: nothing inside '…' is expanded by the shell. */
+function shellQuote(s: string) {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+const CURL_SKIP = new Set(["host", "content-length", "connection", "accept-encoding"]);
+
 function buildCurl(hookUrl: string, req: CapturedRequest): string {
-  const parts = [`curl -X ${req.method} "${hookUrl}${req.path}"`];
+  const parts = [`curl -X ${req.method} ${shellQuote(hookUrl + req.path)}`];
   for (const [k, v] of Object.entries(req.headers)) {
-    if (["host", "content-length", "connection"].includes(k)) continue;
-    parts.push(`  -H "${k}: ${v.replace(/"/g, '\\"')}"`);
+    if (CURL_SKIP.has(k) || k.startsWith("x-forwarded-")) continue;
+    parts.push(`  -H ${shellQuote(`${k}: ${v}`)}`);
   }
   if (req.bodyEncoding === "utf8" && req.body) {
-    parts.push(`  --data '${req.body.replace(/'/g, "'\\''")}'`);
+    parts.push(`  --data-raw ${shellQuote(req.body)}`);
   }
   return parts.join(" \\\n");
 }
 
-function CopyButton({
-  text,
-  className = "chip-btn",
-}: {
-  text: string;
-  className?: string;
-}) {
+/** Merge two newest-first lists, deduping by id. */
+function mergeRequests(a: CapturedRequest[], b: CapturedRequest[]) {
+  const seen = new Set<string>();
+  return [...a, ...b]
+    .filter((r) => (seen.has(r.id) ? false : (seen.add(r.id), true)))
+    .sort((x, y) => y.receivedAt - x.receivedAt);
+}
+
+function CopyButton({ text, className = "chip-btn" }: { text: string; className?: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <button
       className={className}
       onClick={async () => {
-        await navigator.clipboard.writeText(text);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1200);
+        try {
+          await navigator.clipboard.writeText(text);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1200);
+        } catch {
+          /* clipboard blocked (insecure context / permissions) */
+        }
       }}
     >
       {copied ? "copied ✓" : "copy"}
@@ -84,36 +73,56 @@ function CopyButton({
   );
 }
 
-export default function Inspector({ binId }: { binId: string }) {
+export default function Inspector({
+  binId,
+  retentionHours,
+  maxRequests,
+}: {
+  binId: string;
+  retentionHours: number;
+  maxRequests: number;
+}) {
   const [requests, setRequests] = useState<CapturedRequest[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [connected, setConnected] = useState(false);
+  const [linkState, setLinkState] = useState<LinkState>("connecting");
   const [hookUrl, setHookUrl] = useState("");
   const [freshIds, setFreshIds] = useState<Set<string>>(new Set());
 
-  // The absolute hook URL depends on where the app is served from, which the
-  // server doesn't reliably know — derive it in the browser.
+  // The public hook URL depends on the host the app is reached through
+  // (localhost, a Vercel domain, a tunnel), so derive it in the browser.
   useEffect(() => {
     setHookUrl(`${window.location.origin}/api/hook/${binId}`);
   }, [binId]);
 
-  // Initial backlog + live SSE stream.
   useEffect(() => {
     let cancelled = false;
 
-    fetch(`/api/bins/${binId}/requests`)
-      .then((r) => r.json())
-      .then((data) => {
-        if (!cancelled) setRequests(data.requests ?? []);
-      })
-      .catch(() => {});
+    const loadBacklog = () =>
+      fetch(`/api/bins/${binId}/requests`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (!cancelled && data?.requests) {
+            setRequests((prev) => mergeRequests(data.requests, prev));
+          }
+        })
+        .catch(() => {});
 
     const es = new EventSource(`/api/bins/${binId}/stream`);
-    es.addEventListener("hello", () => setConnected(true));
+
+    // "hello" arrives on the first connect and after every reconnect (the
+    // server ends streams periodically on serverless hosts). Refetching the
+    // backlog then covers anything that arrived while we were disconnected.
+    es.addEventListener("hello", () => {
+      setLinkState("live");
+      loadBacklog();
+    });
+
     es.addEventListener("request", (ev) => {
       const req: CapturedRequest = JSON.parse((ev as MessageEvent).data);
       setRequests((prev) =>
-        prev.some((r) => r.id === req.id) ? prev : [req, ...prev]
+        prev.some((r) => r.id === req.id)
+          ? prev
+          : [req, ...prev].slice(0, maxRequests)
       );
       setFreshIds((prev) => new Set(prev).add(req.id));
       setTimeout(() => {
@@ -124,28 +133,38 @@ export default function Inspector({ binId }: { binId: string }) {
         });
       }, 1200);
     });
+
     es.addEventListener("cleared", () => {
       setRequests([]);
       setSelectedId(null);
     });
-    es.onerror = () => setConnected(false);
-    es.onopen = () => setConnected(true);
+
+    es.onerror = () => {
+      // CONNECTING means the browser is already retrying; CLOSED means it gave
+      // up (e.g. the server returned a non-SSE error response).
+      setLinkState(es.readyState === EventSource.CLOSED ? "error" : "reconnecting");
+    };
 
     return () => {
       cancelled = true;
       es.close();
     };
-  }, [binId]);
+  }, [binId, maxRequests]);
 
   const clearAll = useCallback(async () => {
-    await fetch(`/api/bins/${binId}/requests`, { method: "DELETE" });
-    // The SSE "cleared" event resets state; this is just a fallback.
+    await fetch(`/api/bins/${binId}/requests`, { method: "DELETE" }).catch(() => {});
     setRequests([]);
     setSelectedId(null);
   }, [binId]);
 
-  const selected =
-    requests.find((r) => r.id === selectedId) ?? requests[0] ?? null;
+  const selected = requests.find((r) => r.id === selectedId) ?? requests[0] ?? null;
+
+  const linkLabel = {
+    connecting: "connecting",
+    live: "live",
+    reconnecting: "reconnecting",
+    error: "offline",
+  }[linkState];
 
   return (
     <div className="console">
@@ -159,26 +178,31 @@ export default function Inspector({ binId }: { binId: string }) {
           <CopyButton text={hookUrl} />
         </div>
 
-        <div className={`live ${connected ? "on" : ""}`}>
+        <div className={`live ${linkState === "live" ? "on" : ""}`} aria-live="polite">
           <span className="live-dot" />
-          {connected ? "live" : "offline"}
+          {linkLabel}
         </div>
 
         <div className="bar-actions">
           <button className="ghost-btn" onClick={clearAll}>
             clear
           </button>
-          <Link href="/" className="ghost-btn" style={{ display: "inline-block" }}>
+          <Link href="/" className="ghost-btn">
             new bin
           </Link>
         </div>
       </header>
 
       <div className="console-body">
-        <aside className="req-list">
+        <aside className="req-list" aria-label="Captured requests">
           <div className="req-list-head">
-            intercepted — {requests.length}
-            {requests.length === 1 ? " request" : " requests"}
+            <span>
+              intercepted · {requests.length}
+              {requests.length === 1 ? " request" : " requests"}
+            </span>
+            <span className="req-list-retention">
+              keeps last {maxRequests} · {retentionHours}h idle expiry
+            </span>
           </div>
           {requests.map((r) => (
             <button
@@ -195,13 +219,7 @@ export default function Inspector({ binId }: { binId: string }) {
               </span>
             </button>
           ))}
-          {requests.length === 0 && (
-            <div className="empty" style={{ minHeight: 180 }}>
-              <div style={{ color: "var(--ink-faint)", fontSize: 12 }}>
-                nothing intercepted yet
-              </div>
-            </div>
-          )}
+          {requests.length === 0 && <div className="req-list-empty">nothing intercepted yet</div>}
         </aside>
 
         <main className="detail">
@@ -212,9 +230,9 @@ export default function Inspector({ binId }: { binId: string }) {
               <div className="empty-title">
                 Waiting for signals<span className="blink">_</span>
               </div>
-              <p style={{ color: "var(--ink-dim)", maxWidth: "46ch" }}>
-                Send anything to your bin URL — any method, any path, any
-                payload — and it appears here the moment it arrives.
+              <p className="empty-sub">
+                Send anything to your bin URL (any method, any path, any
+                payload) and it appears here the moment it arrives.
               </p>
               {hookUrl && (
                 <div className="curl-hint">
@@ -232,20 +250,14 @@ export default function Inspector({ binId }: { binId: string }) {
   );
 }
 
-function RequestDetail({
-  req,
-  hookUrl,
-}: {
-  req: CapturedRequest;
-  hookUrl: string;
-}) {
+function RequestDetail({ req, hookUrl }: { req: CapturedRequest; hookUrl: string }) {
   const [target, setTarget] = useState("");
   const [replaying, setReplaying] = useState(false);
   const [result, setResult] = useState<ReplayResult | null>(null);
   const targetTouched = useRef(false);
 
-  // Default the replay target to the bin itself — replaying then visibly
-  // lands a new capture, which demos the whole loop nicely.
+  // Default the replay target to the bin itself: replaying then visibly lands
+  // a fresh capture, which demos the whole loop in one click.
   useEffect(() => {
     if (!targetTouched.current && hookUrl) setTarget(hookUrl + req.path);
   }, [hookUrl, req.path]);
@@ -257,13 +269,12 @@ function RequestDetail({
       const res = await fetch("/api/replay", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          binId: req.binId,
-          requestId: req.id,
-          targetUrl: target,
-        }),
+        body: JSON.stringify({ binId: req.binId, requestId: req.id, targetUrl: target }),
       });
-      setResult(await res.json());
+      const data = await res.json();
+      setResult(
+        "ok" in data ? data : { ok: false, durationMs: 0, error: data.error ?? `HTTP ${res.status}` }
+      );
     } catch (err) {
       setResult({
         ok: false,
@@ -278,6 +289,8 @@ function RequestDetail({
   const queryEntries = Object.entries(req.query);
   const headerEntries = Object.entries(req.headers);
   const body = prettyBody(req);
+  const curl = buildCurl(hookUrl, req);
+  const status = result?.status ?? 0;
 
   return (
     <>
@@ -294,45 +307,38 @@ function RequestDetail({
         <div className="section-title">
           <span>replay</span>
         </div>
-        <div className="replay-row">
+        <form
+          className="replay-row"
+          onSubmit={(e) => {
+            e.preventDefault();
+            replay();
+          }}
+        >
           <input
             value={target}
             onChange={(e) => {
               targetTouched.current = true;
               setTarget(e.target.value);
             }}
-            placeholder="https://target-to-resend-to.example/webhook"
+            placeholder="https://your-app.example/webhook"
+            aria-label="Replay target URL"
             spellCheck={false}
+            type="url"
           />
-          <button
-            className="replay-btn"
-            onClick={replay}
-            disabled={replaying || !target}
-          >
+          <button className="replay-btn" type="submit" disabled={replaying || !target}>
             {replaying ? "sending…" : "⟳ replay"}
           </button>
-        </div>
+        </form>
         {result && (
-          <div className="replay-result">
+          <div className="replay-result" role="status">
             {result.ok ? (
-              <span
-                className={
-                  (result.status ?? 0) < 300
-                    ? "status-ok"
-                    : (result.status ?? 0) < 500
-                      ? "status-warn"
-                      : "status-err"
-                }
-              >
+              <span className={status < 300 ? "status-ok" : status < 500 ? "status-warn" : "status-err"}>
                 {result.status} {result.statusText}
               </span>
             ) : (
               <span className="status-err">✕ {result.error}</span>
             )}
-            <span style={{ color: "var(--ink-faint)" }}>
-              {" "}
-              · {result.durationMs}ms
-            </span>
+            <span className="muted"> · {result.durationMs}ms</span>
             {result.ok && result.body && <pre>{result.body}</pre>}
           </div>
         )}
@@ -380,9 +386,9 @@ function RequestDetail({
           <span className="count">
             {req.bodyEncoding === "none"
               ? "empty"
-              : `${formatSize(req.size)}${
-                  req.bodyEncoding === "base64" ? " · binary (base64)" : ""
-                }${req.bodyTruncated ? " · truncated to 1 MiB" : ""}`}
+              : `${formatSize(req.size)}${req.bodyEncoding === "base64" ? " · binary (base64)" : ""}${
+                  req.bodyTruncated ? " · truncated" : ""
+                }`}
           </span>
         </div>
         {req.bodyEncoding === "none" ? (
@@ -400,8 +406,8 @@ function RequestDetail({
           <span>copy as curl</span>
         </div>
         <div className="body-block">
-          <CopyButton text={buildCurl(hookUrl, req)} className="copy-float" />
-          <pre>{buildCurl(hookUrl, req)}</pre>
+          <CopyButton text={curl} className="copy-float" />
+          <pre>{curl}</pre>
         </div>
       </section>
     </>

@@ -1,183 +1,263 @@
-# hookscope — Webhook Inspector
+# hookscope: how it actually works
 
-A mini RequestBin: open a bin, get a temporary URL, and every HTTP request that
-hits that URL is captured and streamed to your browser **live** — method, path,
-query params, headers, body, size, source IP, timestamp. Any captured request
-can be **replayed** (resent) to any URL with one click.
+This is the "explain it to future me" document. The [README](README.md) covers
+*using* and *deploying* the app. This file covers *why the code is shaped the
+way it is*.
 
-## Running it
+## The one-paragraph version
 
-```bash
-npm install
-npm run dev        # http://localhost:3000
-```
+A **bin** is a random id. Anything sent to `/api/hook/<id>/...` is captured
+(method, path, headers, body…) and handed to a **store**. The store does two
+things: it **saves** the capture in a per-bin list, and it **broadcasts** it on
+a per-bin channel. Every browser tab looking at that bin holds open an **SSE
+stream**, which is subscribed to that channel and forwards each capture to the
+page as it arrives. **Replay** looks a capture up in the store and re-sends it
+from the server with `fetch`.
 
-Click **"open a new bin"**, copy the bin URL, and point anything at it:
+## The big design decision: two stores behind one interface
 
-```bash
-curl -X POST http://localhost:3000/api/hook/<binId>/anything/you/like?q=1 \
-  -H "content-type: application/json" \
-  -d '{"event":"order.created"}'
-```
-
-The request appears in the UI the instant it lands — no refresh.
-
-> To receive webhooks from the outside world (Stripe, GitHub, …) you still need
-> a tunnel to your machine, e.g. `ngrok http 3000` or `cloudflared tunnel`, and
-> then you give the provider `https://<tunnel-host>/api/hook/<binId>`.
-
-## Why Next.js (and not Laravel)
-
-Three reasons, all practical:
-
-1. **One process, shared memory.** The whole trick of this tool is that the
-   route which *captures* a request and the route which *streams* to the
-   browser share the same in-memory store and event emitter. Node's
-   long-running single process makes that free. PHP's request-per-process
-   model would force Redis/database + polling or a separate websocket server
-   for the same result.
-2. **SSE is trivial in a route handler.** A `ReadableStream` returned from a
-   Next.js route handler *is* the SSE connection. No extra packages.
-3. **One language end to end** — the store types are the same shapes the React
-   UI consumes.
-
-Total dependency count: `next`, `react`, `react-dom`, `nanoid`. No database,
-no Tailwind, no state library. Styling is a single hand-written CSS file.
-
-## Architecture — the life of a webhook
+Version 1 kept everything in a `Map` plus an `EventEmitter` in memory. That's
+perfect for one long-running Node process, and **broken on Vercel**:
 
 ```
- curl/Stripe/GitHub                 your browser
-        │                                ▲
-        ▼                                │ (2) SSE push, instantly
- POST /api/hook/<binId>/...              │
-        │                        GET /api/bins/<binId>/stream
-        ▼                                │
-   [capture route] ──(1) emit──▶ [EventEmitter] 
-        │                                
-        ▼                                
-   [in-memory Map of bins]  ◀── GET /api/bins/<binId>/requests (initial load)
-        │
-        └──▶ POST /api/replay ──(3) re-issued fetch──▶ any target URL
+          ┌─ instance A ─┐            ┌─ instance B ─┐
+ webhook ─▶ capture route │            │ stream route ◀── your browser
+          │ memory Map A  │  ✗ no link │ memory Map B │
+          └───────────────┘            └──────────────┘
 ```
 
-1. **Capture** — the hook route stores the request in the bin and emits an
-   event named `bin:<binId>`.
-2. **Stream** — every open SSE connection for that bin is subscribed to that
-   event and forwards the captured request down the wire as an SSE `request`
-   event. This is exactly the same publish/subscribe-over-SSE pattern as a
-   notifications feed: EventEmitter on the server, `EventSource` in the
-   browser.
-3. **Replay** — the server (not the browser) re-issues the stored request with
-   `fetch()`, so there are no CORS restrictions on where you can send it.
+On Vercel, each request may run on a different serverless instance, and
+instances share no memory. The webhook lands in A's memory, while your browser's
+stream lives on B and never hears about it.
+
+The fix is a shared store that has **pub/sub**: Redis. So `lib/store/` has one
+interface (`types.ts`) and two implementations:
+
+| | `memory.ts` | `redis.ts` |
+| --- | --- | --- |
+| Save captures | `Map<binId, requests[]>` | `LPUSH` onto `hookscope:bin:<id>:requests` |
+| Broadcast | `EventEmitter.emit(binId)` | `PUBLISH hookscope:bin:<id>` |
+| Live stream listens with | `emitter.on(binId)` | `SUBSCRIBE hookscope:bin:<id>` |
+| Expiry | sweep on bin creation | Redis `EXPIRE` (refreshed on each write) |
+| Rate-limit counters | `Map` | `INCR` + `EXPIRE` |
+| Used when | no `REDIS_URL` (local dev, single server) | `REDIS_URL` / `KV_URL` set |
+
+`lib/store/index.ts → getStore()` picks one. It also includes a deliberate
+guard: on Vercel **without** Redis it throws `StoreNotConfiguredError`, which
+the routes turn into a 503 with a "connect Redis" message. The alternative is an
+app that looks like it works and then silently never shows live updates. Failing
+loudly is kinder.
+
+The routes only ever call `getStore()`, so none of them know or care which
+store is active. That's the point of the interface.
+
+## Life of a webhook (Redis mode)
+
+```
+ 1. POST /api/hook/abc123/stripe       (lands on instance B)
+ 2.   rateLimit("capture:abc123")      INCR counter, reject with 429 if over
+ 3.   read body bytes → utf8 or base64, truncate past MAX_BODY_KB
+ 4.   store.addRequest(captured)       one MULTI round trip:
+        LPUSH  list   capture JSON
+        LTRIM  list   keep newest MAX_REQUESTS_PER_BIN
+        EXPIRE list   BIN_TTL_HOURS
+        SET NX created-at, EXPIRE
+        PUBLISH channel  {"type":"request","request":{…}}
+ 5. Redis delivers the message to every subscriber, e.g. instance A
+ 6. Instance A's stream route writes  "event: request\ndata: {…}\n\n"
+ 7. The browser's EventSource fires → React prepends the row and flashes it
+```
 
 ## File-by-file
 
-### `lib/store.ts` — the entire "database"
+### `lib/config.ts`: every tunable
 
-- `Map<binId, Bin>` where a `Bin` holds an array of `CapturedRequest`s
-  (newest first), plus one shared `EventEmitter`.
-- Both are stashed on **`globalThis`**. That matters in dev: Next.js hot-reload
-  re-evaluates modules, which would otherwise wipe the store every time you
-  save a file. `globalThis` survives reloads because the *process* doesn't
-  restart.
-- Caps: 500 requests per bin, 200 bins, oldest evicted first — a leak guard,
-  since nothing is ever persisted.
-- `subscribe(binId, onRequest, onCleared)` returns an unsubscribe function —
-  the SSE route calls it when the browser disconnects, so listeners never leak.
-- `getOrCreateBin`: unknown bin IDs are auto-created on first touch. That way a
-  hook URL keeps working even after a server restart wipes memory (the history
-  is gone, but new requests are still captured).
+Reads env vars once, with defaults: limits, TTL, rate limits, the Redis URL,
+and `allowPrivateReplay` (true in dev, false in prod). Also holds
+`BIN_ID_PATTERN`, which every route uses to reject junk ids before they reach
+storage (Redis key injection, giant strings, `../` games).
 
-### `app/api/hook/[binId]/[[...path]]/route.ts` — the catch-all capture route
+### `lib/types.ts`: shapes shared by server and browser
 
-- `[[...path]]` is an **optional catch-all** segment, so
-  `/api/hook/abc`, `/api/hook/abc/github/push`, `/api/hook/abc/x?y=z` all
-  resolve to this one file. Providers often demand a specific path shape —
-  this accepts anything.
-- One `capture()` function is exported under **every HTTP method name**
-  (`export { capture as GET, capture as POST, ... }`).
-- Body handling: the raw bytes are read with `arrayBuffer()`, then decoded as
-  strict UTF-8 (`TextDecoder` with `fatal: true`). If decoding throws, the
-  payload is binary → stored as base64 and labelled as such in the UI.
-  Bodies are truncated at 1 MiB so a huge payload can't eat the process.
-- Always answers `200 {ok:true}` — webhook senders see success and don't retry.
+`CapturedRequest`, `BinEvent`, `ReplayResult`. The UI imports these with
+`import type`, which TypeScript erases at compile time, so no server code
+leaks into the browser bundle. (Version 1 duplicated the interface in the UI
+for exactly this reason. `import type` makes that unnecessary.)
 
-### `app/api/bins/[binId]/stream/route.ts` — the SSE endpoint
+### `lib/store/redis.ts`: the interesting one
+
+- **Two connections per instance, cached on `globalThis`.** One handles normal
+  commands. The other is dedicated to `SUBSCRIBE`, because a Redis connection in
+  subscribe mode can't run anything else. Caching on `globalThis` means warm
+  serverless invocations reuse open connections instead of reconnecting every time.
+- **One shared subscriber for all streams on an instance.** node-redis tracks
+  listeners per channel and only sends `UNSUBSCRIBE` to Redis when the last
+  listener for a channel goes away. Five tabs open on one bin means one Redis
+  subscription.
+- **`RESP: 2`.** node-redis v6 defaults to the newer RESP3 protocol. RESP2 is
+  what every hosted Redis speaks, so it's pinned for compatibility.
+- **A failed connect isn't cached.** If `connect()` rejects, the cached promise
+  is cleared so the next request retries instead of failing forever.
+- **`client.on("error")`** must exist. Without it, a dropped Redis connection
+  emits an unhandled `error` event, which crashes the Node process.
+
+### `lib/store/memory.ts`
+
+The same contract with a `Map`, an `EventEmitter`, and a counter map for rate
+limits. Still stored on `globalThis` so Next.js dev hot-reloads don't wipe your
+bins every time you save a file.
+
+### `lib/http.ts`: small shared route helpers
+
+- `clientIp()`: `x-real-ip`, then `x-forwarded-for`. Vercel sets these itself.
+- `rateLimit(key, limit)`: a fixed-window counter via `store.hit()`. Returns
+  a ready-made 429 response, or `null` to proceed.
+- `handleRouteError()`: turns "Redis not configured" into a 503 and anything
+  else into a clean 500, instead of leaking stack traces.
+
+### `lib/safe-fetch.ts`: SSRF protection for replay
+
+On a public deployment, replay means *"server, please send a request to any URL
+I type"*. Without protection, someone could type `http://169.254.169.254/` (the
+cloud metadata service) or `http://10.0.0.5/admin` and use your server to reach
+places they can't. That's called **SSRF**.
+
+The defense has three layers:
+
+1. **A blocklist** (`net.BlockList`) of loopback, private, link-local, CGNAT,
+   IPv6 ULA, NAT64, multicast and reserved ranges. `BlockList` also matches
+   IPv4-mapped IPv6 (`::ffff:127.0.0.1`) against the IPv4 rules.
+2. **IP-literal URLs** (`http://127.0.0.1/`) are checked before fetching. The
+   `URL` parser normalizes tricks like `http://2130706433/` (decimal) and
+   `http://0x7f.1/` (hex) to `127.0.0.1` first, so those are caught too.
+3. **Hostnames are checked inside the socket's DNS lookup.** It uses an undici
+   `Agent` with a custom `lookup`, so the IP that gets validated is exactly the
+   IP that gets connected to. Checking first and fetching second would be
+   beaten by **DNS rebinding**, where a domain answers "public IP" to the check
+   and "127.0.0.1" a millisecond later to the real connection.
+
+This is also why the project depends on `undici` directly: Node's built-in
+`fetch` *is* undici, but the `dispatcher` option needs the package's own
+`Agent` class.
+
+`redirect: "manual"` in the replay route matters too. Following redirects would
+let a public URL bounce the request to an internal one.
+
+### `app/api/hook/[binId]/[[...path]]/route.ts`: capture
+
+- `[[...path]]` is an *optional catch-all*, so `/api/hook/abc` and
+  `/api/hook/abc/any/depth?x=1` both land here.
+- One `capture()` function is exported under every HTTP method name.
+- **Platform headers are stripped** (`x-vercel-*`, `x-middleware-*`…).
+  Vercel injects these, the sender didn't send them, and some (like OIDC
+  tokens and proxy signatures) shouldn't be displayed to anyone.
+- **CORS:** `Access-Control-Allow-Origin: *`, plus an `OPTIONS` preflight
+  answered with 204, so bins work from browser `fetch()` too. Preflights are
+  still captured, because that's what really hit the URL.
+- `HEAD` and `OPTIONS` responses have no body, as HTTP requires.
+
+### `app/api/bins/[binId]/stream/route.ts`: SSE
 
 - Returns a `Response` wrapping a `ReadableStream` with
   `Content-Type: text/event-stream`.
-- On connect it sends a `hello` event (the UI uses it to flip the LIVE badge),
-  subscribes to the bin's emitter, and forwards each captured request as an
-  SSE `request` event; a `cleared` event tells all open tabs the bin was wiped.
-- A comment-line heartbeat (`: heartbeat`) every 25 s stops proxies from
-  killing the idle connection.
-- `req.signal`'s `abort` event fires when the browser tab closes → interval
-  cleared, emitter unsubscribed, stream closed. That cleanup is what keeps
-  listener counts flat no matter how many tabs open and close.
+- Sends `retry: 1500` first, which tells the browser how quickly to reconnect.
+- **`hello` is sent only after the subscription is live.** The browser refetches
+  the backlog when it receives `hello`, so any capture that lands between "page
+  loaded" and "subscribed" is still picked up. That ordering closes a small race.
+- **Serverless lifetime:** `maxDuration = 300` (the Vercel Hobby ceiling with
+  Fluid compute). On Vercel the stream ends itself at about 280s, `EventSource`
+  reconnects automatically, gets a fresh `hello`, and refetches the backlog. To
+  the user it's one continuous live view.
+- A `: heartbeat` comment every 20s keeps proxies from timing out idle streams.
+- Cleanup (clear timers, unsubscribe, close) runs from the client `abort`, the
+  stream `cancel`, and the lifetime timer, and is safe to call more than once.
+  This is what keeps subscriber counts at zero after tabs close (verified
+  against Redis during testing).
 
-### `app/api/bins/route.ts` + `app/api/bins/[binId]/requests/route.ts`
+### `app/api/replay/route.ts`
 
-Plain JSON endpoints: create a bin (`POST /api/bins`), fetch the backlog on
-page load (`GET .../requests`), wipe history (`DELETE .../requests`).
+Validates input, rate-limits per IP, looks the capture up, drops
+connection-level headers (`host`, `content-length`, `x-forwarded-*`…) that
+would corrupt the new request, and calls `safeFetch` with a 15s timeout. The
+target's status, headers and first 64 KB of body go back to the UI.
+`describeFetchError` unwraps undici's generic `"fetch failed"` into something
+readable (`ECONNREFUSED`, "Blocked: … private address", timeouts).
 
-### `app/api/replay/route.ts` — resend a captured request
+### `app/api/bins/...`: create, list, clear
 
-- Body: `{ binId, requestId, targetUrl }`. Looks the capture up in the store
-  and re-issues it server-side with `fetch()`.
-- **Header filtering** is the subtle part: `host`, `content-length`,
-  `connection`, `accept-encoding`, `x-forwarded-*` etc. describe the *original
-  connection*, not the request. Forwarding them verbatim would send a wrong
-  Host header or a stale Content-Length, so they're dropped and `fetch`
-  regenerates them for the new target.
-- 15-second timeout via `AbortSignal.timeout`, redirects not followed
-  (`redirect: "manual"` — you want to see the 3xx, not chase it), and the
-  target's status/headers/body (first 64 KB) are reported back to the UI.
+`POST /api/bins` makes a 12-character id (about 62 bits of randomness, which is
+what makes "knowing the URL" safe enough as the only access control) and is
+rate-limited per IP. `GET`/`DELETE …/requests` read or clear a bin. Clearing
+publishes a `cleared` event, so every open tab empties at once.
 
-### `app/b/[binId]/inspector.tsx` — the console UI (client component)
+### `app/b/[binId]/inspector.tsx`: the console UI
 
-State machine is small: `requests[]`, `selectedId`, `connected`, `freshIds`.
+- Opens one `EventSource`. On `hello` it **merges** the backlog into state,
+  deduped by id and sorted by time. A merge rather than a replace, so rows that
+  streamed in while the fetch was in flight aren't lost.
+- Connection badge states: `connecting`, `live`, `reconnecting` (the browser is
+  retrying, e.g. after the 280s serverless rollover), `offline` (it gave up).
+- The detail pane follows the newest request until you click one.
+- **Copy as curl** uses POSIX single-quote escaping. Inside `'…'` nothing is
+  expanded, and a literal `'` becomes `'\''`. The old version used double quotes,
+  where a header containing `$HOME` or a backtick would have been executed by
+  your shell when you pasted it.
+- The replay target defaults to the bin itself, so one click demos the whole loop.
 
-- On mount: one `fetch` for the backlog, then an `EventSource` for the live
-  stream. New arrivals are prepended (deduped by id — a request can arrive
-  via both the backlog fetch and SSE in a race). `freshIds` drives the brief
-  highlight flash on new rows.
-- If you haven't clicked a row, the detail pane follows the newest request
-  ("follow mode"); once you select one, it stays put.
-- Detail pane: query params table, headers table, body (JSON is
-  pretty-printed via parse→re-stringify; binary shows base64), a **copy as
-  curl** block that reconstructs the request as a runnable command, and the
-  **replay** panel.
-- The replay target defaults to the bin's own URL — hit replay and you watch
-  the copy arrive in the list a beat later, which is the whole loop in one
-  click.
-- The hook URL is built from `window.location.origin` in the browser, because
-  the server doesn't reliably know what host/port you're reaching it on.
+### `app/page.tsx` + `app/create-bin-button.tsx`
 
-### `app/page.tsx` — landing
+The landing page is a **server component**, so it's prerendered to static HTML
+at build time (fast first paint, crawlable). Only the button is a client
+component. It shows the server's error text, such as rate limits or missing
+Redis.
 
-One button: `POST /api/bins` → redirect to `/b/<id>`.
+### SEO and sharing
+
+- `app/layout.tsx`: title, description, Open Graph and Twitter metadata.
+  `metadataBase` comes from `NEXT_PUBLIC_SITE_URL` or Vercel's
+  `VERCEL_PROJECT_PRODUCTION_URL`, so share cards get absolute URLs.
+- `app/opengraph-image.tsx`: the link-preview card, drawn with JSX via
+  `next/og` and rendered to PNG at build time.
+- `app/icon.svg`: the favicon. Next serves it automatically.
+- `app/robots.ts`: lets crawlers index the landing page and blocks `/b/` and
+  `/api/`. Bin pages also send `noindex` (meta tag and `X-Robots-Tag`), because
+  they're private scratch space.
+
+### `next.config.ts`
+
+Turns off the `X-Powered-By` header and adds security headers (`nosniff`,
+`X-Frame-Options: DENY`, HSTS, a restrictive `Permissions-Policy`,
+`Referrer-Policy`).
 
 ### Design (`app/globals.css`)
 
-"Signal intercept console": near-black green-tinted background, phosphor
-chartreuse accent, faint CRT scanline overlay (a `position: fixed`
-repeating-gradient layer), IBM Plex Mono for all data, Instrument Serif
-italics for display moments (the landing headline, empty states). HTTP
-methods are color-coded (GET green, POST amber, PUT blue, PATCH violet,
-DELETE red) consistently in the list and detail views. Loaded via
-`next/font` so the fonts are self-hosted at build time.
+"Signal intercept console": a near-black green base, a chartreuse "phosphor"
+accent, a faint CRT scanline overlay, IBM Plex Mono for data, and Instrument
+Serif italics for display text. HTTP methods are color-coded the same way
+everywhere. It respects `prefers-reduced-motion`, and keyboard focus gets a
+visible outline.
 
-## Deliberate limitations
+## How it was tested
 
-- **In-memory only.** Restart = empty bins. That's a feature for a throwaway
-  debugging tool, but don't expect history to survive.
-- **Single process.** The store/emitter pattern assumes one Node process. It
-  would not work on serverless (Vercel) or a multi-worker deploy without
-  swapping the store for Redis pub/sub. Run it with `npm run dev` or
-  `npm run build && npm start` on one machine.
-- **No auth.** Anyone who knows a bin id can view it. Bin ids are 10 random
-  characters (~52 bits), which is plenty for a local/dev tool.
-- **Replay is open.** The replay endpoint will send to any http(s) URL you
-  give it — again fine locally, but it's an SSRF vector if you ever host this
-  publicly, so don't.
+- **Cross-instance (the Vercel scenario):** two production servers (`next
+  start` on :3001 and :3002) pointed at the same Redis. Browser stream on
+  :3001, webhooks sent to :3002. Requests and `cleared` events arrived live.
+- **SSRF:** replay to `localhost`, `127.0.0.1`, `[::ffff:127.0.0.1]`,
+  `2130706433`, `169.254.169.254`, `10.0.0.5` and `file://` were all refused.
+  `https://example.com` went through.
+- **Limits:** the 11th bin creation in a minute returned 429. Invalid bin ids
+  returned 404.
+- **Cleanup:** the Redis subscriber count dropped back to 0 when streams closed.
+- **Memory mode:** live stream, backlog, and replay-to-self in `npm run dev`.
+
+## Known limitations
+
+- **Bin ids are bearer tokens.** Anyone with the URL can view the bin. Fine for
+  debugging, not for production secrets.
+- **Rate limits are fixed-window**, so a burst at a window boundary can briefly
+  get up to 2× through. That's acceptable for abuse prevention.
+- **Body cap is 256 KB by default.** Vercel itself rejects request bodies over
+  4.5 MB.
+- **Each capture costs about 8 Redis commands** (rate limit + store + publish).
+  Upstash's free tier covers tens of thousands of captures a month, plenty for
+  personal use. A popular public instance would need a paid tier.
